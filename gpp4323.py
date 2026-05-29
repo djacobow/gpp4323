@@ -37,9 +37,17 @@ class Channel:
     def __init__(self, gpp, n):
         self.gpp = gpp
         self.n = n
-    
+        self.mode = None  # last set: 'IND'/'CV'/'CC'/'CR', None if not yet established
+
     def meas(self):
         return self.gpp.meas().asDict()[self.n]
+
+    @_locked_gpp
+    def get_mode(self):
+        if self.mode is None:
+            self.gpp._sendline(f":MODE{self.n}?")
+            self.mode = self.gpp._expect(r'(\S+)').group(1)
+        return self.mode
     
     @_locked_gpp
     def disable(self):
@@ -73,17 +81,27 @@ class Channel:
     # TODO: OVP/OCP
     @_locked_gpp
     def set_source(self, voltage, current):
-        self.gpp._sendline("TRACK0")
-        if self.n == 1 or self.n == 2:
-            self.gpp._sendline(f":LOAD{self.n}:CC OFF")
+        switching = self.mode != 'IND'
+        if switching:
+            # output off across the switch so a stale setpoint from the old
+            # mode is never briefly driven in the new one
+            self.disable()
+            self.gpp._sendline("TRACK0")
+            if self.n == 1 or self.n == 2:
+                self.gpp._sendline(f":LOAD{self.n}:CC OFF")
+                self.gpp._sendline(f":LOAD{self.n}:CV OFF")
+            self.gpp.wait()
+            if self.n == 1 or self.n == 2:
+                self.gpp._sendline(f":MODE{self.n}?")
+                rv = self.gpp._expect(r'(\S+)')
+                if rv.group(1) != 'IND':
+                    raise RuntimeError('supply failed to switch to source mode')
+            self.mode = 'IND'
         self.gpp._sendline(f":SOUR{self.n}:CURR {current}")
         self.gpp._sendline(f":SOUR{self.n}:VOLT {voltage}")
         self.gpp.wait()
-        if self.n == 1 or self.n == 2:
-            self.gpp._sendline(f":MODE{self.n}?")
-            rv = self.gpp._expect(r'(\S+)')
-            if rv.group(1) != 'IND':
-                raise RuntimeError('supply failed to switch to source mode')
+        if switching:
+            self.enable()
     
     @_locked_gpp
     def set_load(self, cv = None, cc = None, cr = None):
@@ -92,23 +110,28 @@ class Channel:
            (cv is not None and cr is not None) or \
            (cc is not None and cr is not None):
             raise ValueError(f'supply can track only one of CV / CC / CR mode at a time {cc} {cv} {cr}')
+        mode = 'CV' if cv is not None else 'CC' if cc is not None else 'CR'
+        switching = self.mode != mode
+        if switching:
+            # output off across the switch so a stale setpoint from the old
+            # mode is never briefly driven in the new one
+            self.disable()
+            self.gpp._sendline(f":LOAD{self.n}:{mode} on")
+            self.gpp.wait()
+            self.gpp._sendline(f":MODE{self.n}?")
+            rv = self.gpp._expect(r'(\S+)')
+            if rv.group(1) != mode:
+                raise RuntimeError(f'supply failed to switch to {mode} mode')
+            self.mode = mode
         if cv is not None:
-            mode = 'CV'
             self.gpp._sendline(f":SOUR{self.n}:VOLT {cv}")
-            self.gpp._sendline(f":LOAD{self.n}:CV on")
         elif cc is not None:
-            mode = 'CC'
             self.gpp._sendline(f":SOUR{self.n}:CURR {cc}")
-            self.gpp._sendline(f":LOAD{self.n}:CC on")
         elif cr is not None:
-            mode = 'CR'
             self.gpp._sendline(f":LOAD{self.n}:RES {cr}")
-            self.gpp._sendline(f":LOAD{self.n}:CR on")
         self.gpp.wait()
-        self.gpp._sendline(f":MODE{self.n}?")
-        rv = self.gpp._expect(r'(\S+)')
-        if rv.group(1) != mode:
-            raise RuntimeError(f'supply failed to switch to {mode} mode')
+        if switching:
+            self.enable()
     
     @_locked_gpp
     def is_load(self):
@@ -180,7 +203,7 @@ class Measurement:
     def __init__(self, parent):
         self.gpp = parent
         self.update()
-    
+
     def __repr__(self):
         return '\n'.join([
             f"[Ch#{self.data[d]['channel']}: {self.data[d]['voltage']}V, {self.data[d]['current']}A, {self.data[d]['power']}W mode:{self.data[d]['mode']}]" for d in self.data
@@ -195,12 +218,9 @@ class Measurement:
             'voltage': float(ch[0]),
             'current': float(ch[1]),
             'power'  : float(ch[2]),
-            'channel': chn+1 } for chn,ch in enumerate(chs)
+            'channel': chn+1,
+            'mode'   : self.gpp.channel(chn+1).get_mode() } for chn,ch in enumerate(chs)
         }
-        for chn in self.data:
-            self.gpp._sendline(f":MODE{chn}?")
-            rv = self.gpp._expect(r'(\S+)')
-            self.data[chn]['mode'] = rv[1]
 
     def asDict(self):
         return self.data
@@ -211,7 +231,7 @@ class GPPException(Exception):
             super().__init__(message)
 
 class GPP4323:
-    def __init__(self, host=None, sport=None, debug=False):
+    def __init__(self, host=None, sport=None, debug=False, timeout=5.0):
         self.lock = threading.RLock()
         self.debug         = debug
         self.s = None
@@ -219,6 +239,7 @@ class GPP4323:
             self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             dprint(f'Trying to connect to (host,port): {host}')
             self.s.connect(host)
+            self.s.settimeout(timeout)
             self.file = self.s.makefile('rwb')
         elif sport is not None and sport[0] is not None and sport[1] is not None:
             dprint(f'Trying to connect to (port,speed): {sport}')
@@ -280,6 +301,9 @@ class GPP4323:
 
     def alloff(self):
         self._sendline("ALLOUTOFF")
+
+    def local(self):
+        self._sendline("LOCAL")
 
     def _expect(self, pattern):
         s = self.file.readline()
